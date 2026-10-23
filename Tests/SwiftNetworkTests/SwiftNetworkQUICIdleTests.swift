@@ -212,6 +212,168 @@ final class SwiftNetworkQUICIdleTests: NetTestCase {
             clientMTU: 1550
         )
     }
+
+    func testQUICImmediateAckWaitsForApplicationAnswerInOutboundBatch() {
+        // swift-nio-quic batches outbound writes for a read loop and lets the application answer
+        // only after the connection has processed the loop's input. An ACK owed immediately has
+        // to wait for that answer instead of going out in a packet of its own.
+        QUICTestHarness().runQUICTest(
+            dataBlock: Array("Hello World!".utf8),
+            afterHandshake: { harness in
+                self.holdTimers(in: harness)
+            },
+            afterData: { harness in
+                guard let state = harness.state, let clientStream = harness.createNewStream(identifier: "C2") else {
+                    XCTFail("Harness state and a second client stream need to be present to proceed")
+                    return
+                }
+                let server = state.serverInstance
+                var firstPacketNumber = PacketNumber.none
+                var packetNumberBeforeAnswer = PacketNumber.none
+                var answerCarriesAck = false
+                let expectation = XCTestExpectation(description: "Wait for the server to answer the request")
+
+                self.onContext(of: harness) {
+                    state.serverHarness.waitForNewFlow {
+                        // The new flow arrives while the server processes the input; answer once that
+                        // processing is done, the way swift-nio-quic does.
+                        harness.context.async {
+                            guard let serverStream = state.serverHarness.upperHarnesses.last else {
+                                XCTFail("Server stream needs to be present to answer")
+                                expectation.fulfill()
+                                return
+                            }
+                            packetNumberBeforeAnswer = server.protector.getPacketNumber(for: .applicationData)
+                            serverStream.fromExternal { eventContext in
+                                while serverStream.read(in: &eventContext) != nil {}
+                                _ = serverStream.write(Array("pong".utf8), sendFIN: true, in: &eventContext)
+                            }
+                            state.serverHarness.invokeApplicationEvent(.outboundDataBatchEnd)
+                            server.recovery.withImmutableInnerState(packetNumberSpace: .applicationData) { innerState in
+                                innerState.findSentPacketEntry(packetNumber: firstPacketNumber) { entry in
+                                    answerCarriesAck =
+                                        entry.packet.transmittedItems.ackFrame != nil
+                                        && !entry.packet.transmittedItems.sentStreams.isEmpty
+                                }
+                            }
+                            expectation.fulfill()
+                        }
+                    }
+                    // A gap in the client's packet numbers also makes the server ACK immediately.
+                    server.ack.ackAgressively()
+                    firstPacketNumber = server.protector.getPacketNumber(for: .applicationData)
+                    state.serverHarness.invokeApplicationEvent(.outboundDataBatchStart)
+                    XCTAssertTrue(
+                        clientStream.write(Array("ping".utf8), sendFIN: true),
+                        "Client should send the request"
+                    )
+                }
+
+                let waitResult = XCTWaiter.wait(for: [expectation], timeout: 2.0)
+                XCTAssertEqual(waitResult, .completed, "Server should answer the request")
+                XCTAssertEqual(
+                    packetNumberBeforeAnswer.value,
+                    firstPacketNumber.value,
+                    "Server should not send a packet while the application still has to answer"
+                )
+                XCTAssertTrue(answerCarriesAck, "Server's answer should carry the ACK it owes")
+            }
+        )
+    }
+
+    func testQUICConnectionIdleOnceHeldImmediateAckIsSent() {
+        // The end of an outbound batch can send the last thing a connection owes, an immediate ACK
+        // it held for the batch. The connection is idle again after that.
+        QUICTestHarness().runQUICTest(
+            dataBlock: Array("Hello World!".utf8),
+            afterHandshake: { harness in
+                self.holdTimers(in: harness)
+            },
+            afterData: { harness in
+                guard let state = harness.state else {
+                    XCTFail("Harness state needs to be present to proceed")
+                    return
+                }
+                let server = state.serverInstance
+                let client = state.clientInstance
+
+                self.onContext(of: harness) {
+                    for upperHarness in state.serverHarness.upperHarnesses {
+                        upperHarness.invokeConnectionIdleEvent()
+                    }
+                    // Acknowledge the echo, after which the server owes nothing.
+                    client.fromExternal { eventContext in
+                        client.fireDelayedAckTimer(at: .systemNow, in: &eventContext)
+                    }
+                }
+                self.onContext(of: harness) {
+                    XCTAssertTrue(
+                        server.currentPath?.reportedIdleEvent ?? false,
+                        "setup: server should be idle once the echo is acknowledged"
+                    )
+                    // A gap in the client's packet numbers also makes the server ACK immediately.
+                    server.ack.ackAgressively()
+                    state.serverHarness.invokeApplicationEvent(.outboundDataBatchStart)
+                    client.fromExternal { eventContext in
+                        client.withPendingItems(for: .applicationData) { $0.ping = true }
+                        client.sendFrames(in: &eventContext)
+                    }
+                }
+                self.onContext(of: harness) {
+                    XCTAssertTrue(
+                        server.applicationPendingItems.isAckSet,
+                        "setup: server should hold the ACK for the client's PING until the batch ends"
+                    )
+                    XCTAssertFalse(
+                        server.currentPath?.reportedIdleEvent ?? true,
+                        "Server should not be idle while it holds an ACK"
+                    )
+                    state.serverHarness.invokeApplicationEvent(.outboundDataBatchEnd)
+                    XCTAssertTrue(
+                        server.currentPath?.reportedIdleEvent ?? false,
+                        "Server should be idle once the end of the batch has sent the ACK"
+                    )
+                }
+            }
+        )
+    }
+
+    /// Keeps the timers that send on their own from firing during a test: the delayed ACK timers,
+    /// and the server's PTO, which waits for the client's delayed ACK.
+    private func holdTimers(in harness: QUICTestHarness) {
+        self.onContext(of: harness) {
+            guard let server = harness.state?.serverInstance, let client = harness.state?.clientInstance else {
+                XCTFail("Harness state needs to be present to proceed")
+                return
+            }
+            for connection in [server, client] {
+                connection.fromExternal { eventContext in
+                    connection.ack.maxDelay = .seconds(30)
+                    if connection.ack.timerScheduled, let timerID = connection.ack.timerID {
+                        connection.timer.reschedule(
+                            identifier: timerID,
+                            fromNow: connection.ack.maxDelay,
+                            timerNow: connection.now,
+                            in: &eventContext
+                        )
+                    }
+                }
+            }
+            server.currentPath?.rtt.remoteMaxAckDelay = .seconds(30)
+        }
+    }
+
+    /// Runs `body` on the harness's context and waits for it. Anything `body` sends to the peer
+    /// arrives before a later step runs.
+    private func onContext(of harness: QUICTestHarness, _ body: @escaping () -> Void) {
+        let expectation = XCTestExpectation(description: "Wait for the step to run on the context")
+        harness.context.async {
+            body()
+            expectation.fulfill()
+        }
+        let waitResult = XCTWaiter.wait(for: [expectation], timeout: 2.0)
+        XCTAssertEqual(waitResult, .completed, "Step should run on the context")
+    }
 }
 #endif
 #endif

@@ -3370,8 +3370,9 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
             return false
         }
         // For ACK bundling purposes make sure to rely on the ACK-delay timer as much as possible,
-        // unless an immediate ACK needs to be processed.
-        guard !applicationPendingItems.isAckOnly || delayedACK || ack.immediateAcks > 0 else {
+        // unless an immediate ACK needs to be processed. While the application batches its writes,
+        // an immediate ACK waits for the end of the batch, where it can ride on what was written.
+        guard !applicationPendingItems.isAckOnly || delayedACK || (ack.immediateAcks > 0 && !pendOutboundData) else {
             // Make sure the ack-delay timer is armed if returning early
             ack.scheduleDelayedAck(in: &eventContext)
             return false
@@ -6809,6 +6810,8 @@ extension QUICConnection {
             // Stop pending processing, resume sending
             pendOutboundData = false
             sendFrames(in: &eventContext)
+            // The batch may have sent an ACK that was held for it, the last thing the connection owed
+            checkConnectionIdle(unackedPacketCount: self.ack.unackedPacketCount, in: &eventContext)
             return .consumed
         }
 
