@@ -2603,7 +2603,10 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
             applyToAllFlows { stream in
                 applicationPendingItems.prependStreamToService(stream)
             }
-            sendFrames(in: &eventContext)
+            // The streams are queued to be serviced; under a batch the send waits for the batch's end.
+            if !pendOutboundData {
+                sendFrames(in: &eventContext)
+            }
             // We've already processed all the unblocked streams
             applicationPendingItems.unblockedSendStreams.removeAll(connection: self)
         } else {
@@ -2613,7 +2616,9 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
                 // Try to send data on just a single stream due
                 // to a new MAX_STREAM_DATA frame.
                 applicationPendingItems.prependStreamToService(stream)
-                sendFrames(in: &eventContext)
+                if !pendOutboundData {
+                    sendFrames(in: &eventContext)
+                }
 
                 stream.updateOutboundFlowControlCredit(connection: self)
             }
@@ -2643,7 +2648,13 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
             }
         }
         synchronizeStats()
-        sendFrames(in: &eventContext)
+        // While the application batches its sends, whatever is pending (an ACK for the datagrams just
+        // received, say) goes out with the batch, when the application ends it: sending it now would
+        // put a datagram of its own on the wire just ahead of the data the application is about to
+        // write.
+        if !pendOutboundData {
+            sendFrames(in: &eventContext)
+        }
     }
 
     // Handle an outbound write to stream, queue the data for sending in the
