@@ -3382,7 +3382,7 @@ public final class QUICConnection: ManyToManyApplicationStreamProtocol,
         }
         // For ACK bundling purposes make sure to rely on the ACK-delay timer as much as possible,
         // unless an immediate ACK needs to be processed.
-        guard !applicationPendingItems.isAckOnly || delayedACK || ack.immediateAcks > 0 else {
+        guard !applicationPendingItems.isAckOnly || delayedACK || (ack.immediateAcks > 0 && !pendOutboundData) else {
             // Make sure the ack-delay timer is armed if returning early
             ack.scheduleDelayedAck(in: &eventContext)
             return false
